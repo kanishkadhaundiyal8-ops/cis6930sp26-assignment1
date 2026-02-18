@@ -1,0 +1,227 @@
+
+================ PIPELINE REPORT ================
+
+PLAN:
+{
+  "limit": 100,
+  "offset": 0,
+  "table_name": "incidents",
+  "categories": [
+    "THEFT/PROPERTY",
+    "ASSAULT/VIOLENCE",
+    "DRUG/ALCOHOL",
+    "TRAFFIC",
+    "BURGLARY",
+    "OTHER"
+  ]
+}
+
+SCHEMA:
+{
+  "source": "https://data.cityofgainesville.org/resource/gvua-xt9q.json",
+  "notes": "Field names are defined by the Socrata dataset and may evolve. Use fetch_incidents() to inspect live keys.",
+  "expected_common_fields": [
+    "incident_type",
+    "report_date",
+    "offense_date",
+    "case_number",
+    "location",
+    "latitude",
+    "longitude",
+    "status"
+  ],
+  "pagination": {
+    "limit_param": "$limit",
+    "offset_param": "$offset",
+    "max_limit": 2000
+  }
+}
+
+ANOMALIES (sample):
+{
+  "total_rows": 100,
+  "missing_type_or_narrative": {
+    "count": 0,
+    "sample": []
+  },
+  "missing_dates": {
+    "count": 0,
+    "sample": []
+  },
+  "bad_coordinates": {
+    "count": 0,
+    "sample": []
+  }
+}
+
+SAVE RESULT:
+{
+  "ok": true,
+  "db_path": "/blue/cis6930/kdhaundiyal/cis6930sp26-assignment1/data/incidents.db",
+  "table": "incidents",
+  "rows_saved": 100,
+  "columns": [
+    "id",
+    "narrative",
+    "report_date",
+    "offense_date",
+    "report_hour_of_day",
+    "report_day_of_week",
+    "offense_hour_of_day",
+    "offense_day_of_week",
+    "city",
+    "state",
+    "address",
+    "latitude",
+    "longitude",
+    "location",
+    ":@computed_region_43jd_v64e",
+    ":@computed_region_ndi2_bfht",
+    ":@computed_region_ecgy_hwrz",
+    ":@computed_region_e6r8_dw75",
+    ":@computed_region_axii_i744",
+    ":@computed_region_u9vc_vmbc",
+    ":@computed_region_4rat_gsiv",
+    "report_date_parsed",
+    "offense_date_parsed",
+    "category",
+    ":@computed_region_9cfm_spy5"
+  ]
+}
+
+SUMMARY:
+{
+  "ok": true,
+  "db_path": "/blue/cis6930/kdhaundiyal/cis6930sp26-assignment1/data/incidents.db",
+  "table": "incidents",
+  "row_count": 100,
+  "top_values": [
+    [
+      "Theft Petit - Retail",
+      8
+    ],
+    [
+      "Suspicious Incident",
+      7
+    ],
+    [
+      "Trespass",
+      4
+    ],
+    [
+      "Lost Property",
+      4
+    ],
+    [
+      "Domestic Simple Battery",
+      4
+    ],
+    [
+      "Dcf Investigations",
+      4
+    ],
+    [
+      "Battery (simple)",
+      4
+    ],
+    [
+      "Baker Act",
+      4
+    ],
+    [
+      "Lost/stolen Vehicle Tag / Decal",
+      3
+    ],
+    [
+      "Information",
+      3
+    ]
+  ],
+  "date_ranges": {
+    "report_date": {
+      "min": "2026-02-13T11:09:29.000",
+      "max": "2026-02-16T23:15:00.000"
+    },
+    "offense_date": {
+      "min": "2017-02-14T10:51:05.000",
+      "max": "2026-02-16T23:00:00.000"
+    },
+    "report_date_parsed": {
+      "min": "2026-02-13T11:09:29",
+      "max": "2026-02-16T23:15:00"
+    },
+    "offense_date_parsed": {
+      "min": "2017-02-14T10:51:05",
+      "max": "2026-02-16T23:00:00"
+    }
+  }
+}
+
+QUERIES:
+[
+  {
+    "sql": "SELECT COUNT(*) AS total_rows FROM incidents;",
+    "result": {
+      "ok": true,
+      "columns": [
+        "total_rows"
+      ],
+      "rows": [
+        [
+          100
+        ]
+      ]
+    }
+  },
+  {
+    "sql": "SELECT category, COUNT(*) AS n FROM incidents GROUP BY category ORDER BY n DESC LIMIT 10;",
+    "result": {
+      "ok": true,
+      "columns": [
+        "category",
+        "n"
+      ],
+      "rows": [
+        [
+          "other",
+          38
+        ],
+        [
+          "theft/property",
+          30
+        ],
+        [
+          "assault/violence",
+          23
+        ],
+        [
+          "burglary",
+          6
+        ],
+        [
+          "drug/alcohol",
+          3
+        ]
+      ]
+    }
+  },
+  {
+    "sql": "SELECT MIN(report_date) AS min_date, MAX(report_date) AS max_date FROM incidents;",
+    "result": {
+      "ok": true,
+      "columns": [
+        "min_date",
+        "max_date"
+      ],
+      "rows": [
+        [
+          "2026-02-13T11:09:29.000",
+          "2026-02-16T23:15:00.000"
+        ]
+      ]
+    }
+  }
+]
+
+=================================================
+

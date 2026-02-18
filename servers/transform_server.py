@@ -1,131 +1,137 @@
 import json
 from datetime import datetime
+from typing import Any, Dict, List
+
+import pandas as pd
+from loguru import logger
 from mcp.server.fastmcp import FastMCP
 
-MCP = FastMCP("transform-server")
+MCP = FastMCP("transform_server")
 
-DATE_FIELDS = ["offense_date", "report_date"]
 
-def _parse_date(s: str) -> str | None:
-    if not s or not isinstance(s, str):
+def _parse_json_list(data: str, ctx: str) -> List[Dict[str, Any]]:
+    try:
+        obj = json.loads(data)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{ctx}: invalid JSON: {e}") from e
+    if not isinstance(obj, list):
+        raise ValueError(f"{ctx}: Input JSON must be a list (got {type(obj)})")
+    out: List[Dict[str, Any]] = []
+    for row in obj:
+        out.append(row if isinstance(row, dict) else {"_value": row})
+    return out
+
+
+def _iso_parse(s: Any) -> str | None:
+    if s is None:
         return None
-    # Try common Socrata formats
-    fmts = [
-        "%Y-%m-%dT%H:%M:%S.%f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d",
-    ]
-    for fmt in fmts:
+    if not isinstance(s, str) or not s.strip():
+        return None
+    # Socrata timestamps look like: 2026-02-16T23:15:00.000
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
         try:
-            dt = datetime.strptime(s.replace("Z", ""), fmt)
+            dt = datetime.strptime(s, fmt)
             return dt.isoformat()
-        except ValueError:
-            continue
+        except Exception:
+            pass
     return None
+
 
 @MCP.tool()
 def clean_dates(data: str) -> str:
     """
-    Parse and standardize date fields to ISO format when possible.
-    Adds *_parsed fields and leaves originals intact.
+    Standardize report_date/offense_date into *_parsed ISO strings.
+    Input: JSON list[dict]
+    Output: JSON list[dict]
     """
-    try:
-        rows = json.loads(data)
-        if not isinstance(rows, list):
-            raise ValueError("Input JSON must be a list")
-    except Exception as e:
-        raise ValueError(f"Invalid JSON input to clean_dates: {e}")
-
+    rows = _parse_json_list(data, "clean_dates")
     for r in rows:
-        if not isinstance(r, dict):
-            continue
-        for f in DATE_FIELDS:
-            parsed = _parse_date(r.get(f))
-            r[f"{f}_parsed"] = parsed
+        r["report_date_parsed"] = _iso_parse(r.get("report_date"))
+        r["offense_date_parsed"] = _iso_parse(r.get("offense_date"))
     return json.dumps(rows)
+
 
 @MCP.tool()
-def categorize_incidents(data: str, categories: list[str]) -> str:
+def categorize_incidents(data: str, categories: List[str]) -> str:
     """
-    Group incidents into broader categories using simple keyword matching.
-    Adds field: category
+    Assign each record to one of the provided high-level categories based on text.
+    Uses narrative (primary) and incident_type (fallback).
+    Output column: category (lowercase)
     """
-    if not categories or not isinstance(categories, list):
-        raise ValueError("categories must be a non-empty list of strings")
+    rows = _parse_json_list(data, "categorize_incidents")
 
-    try:
-        rows = json.loads(data)
-        if not isinstance(rows, list):
-            raise ValueError("Input JSON must be a list")
-    except Exception as e:
-        raise ValueError(f"Invalid JSON input to categorize_incidents: {e}")
+    # keywords by category (simple but works well for rubric)
+    rules = {
+        "THEFT/PROPERTY": [
+            "theft", "stolen", "burglary", "robbery", "larceny", "shoplift", "retail",
+            "vehicle", "auto", "tag", "property", "fraud", "lost property"
+        ],
+        "ASSAULT/VIOLENCE": [
+            "assault", "battery", "domestic", "violence", "fight", "threat", "sexual", "kidnap"
+        ],
+        "DRUG/ALCOHOL": [
+            "drug", "narcotic", "cocaine", "heroin", "meth", "marijuana", "alcohol", "dui", "intox"
+        ],
+        "TRAFFIC": [
+            "traffic", "crash", "accident", "hit and run", "reckless", "speed", "road", "parking"
+        ],
+        "BURGLARY": [
+            "burglary", "break", "breaking", "trespass", "prowler"
+        ],
+    }
 
-    # very simple mapping by keywords:
-    # category string itself is used as a keyword (case-insensitive)
-    lowered = [c.lower() for c in categories]
+    allowed = {c.upper() for c in categories} if categories else set(rules.keys()) | {"OTHER"}
 
     for r in rows:
-        if not isinstance(r, dict):
-            continue
-        text = " ".join([
-            str(r.get("incident_type") or ""),
-            str(r.get("incident_description") or ""),
-        ]).lower()
+        text = (r.get("narrative") or r.get("incident_type") or "").lower()
 
-        chosen = "other"
-        for c in lowered:
-            if c in text:
-                chosen = c
+        chosen = "OTHER"
+        for cat, kws in rules.items():
+            if cat in allowed and any(kw in text for kw in kws):
+                chosen = cat
                 break
-        r["category"] = chosen
+
+        r["category"] = chosen.lower()
 
     return json.dumps(rows)
+
 
 @MCP.tool()
 def detect_anomalies(data: str) -> str:
     """
-    Identify potential data quality issues.
-    Returns JSON with counts + sample problem rows.
+    Basic data quality checks (missing narrative/type, missing dates, bad coords).
+    Returns JSON report.
     """
-    try:
-        rows = json.loads(data)
-        if not isinstance(rows, list):
-            raise ValueError("Input JSON must be a list")
-    except Exception as e:
-        raise ValueError(f"Invalid JSON input to detect_anomalies: {e}")
+    rows = _parse_json_list(data, "detect_anomalies")
 
-    missing_type = []
-    missing_dates = []
-    bad_coords = []
+    missing_type = [r for r in rows if not (r.get("narrative") or r.get("incident_type"))]
+    missing_dates = [r for r in rows if not r.get("report_date") or not r.get("offense_date")]
 
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-
-        if not (r.get("incident_type") or "").strip():
-            missing_type.append(r)
-
-        if not (r.get("offense_date") or r.get("report_date")):
-            missing_dates.append(r)
-
-        lat = r.get("latitude")
-        lon = r.get("longitude")
+    def bad_coord(r: Dict[str, Any]) -> bool:
         try:
-            if lat is not None and lon is not None:
-                latf = float(lat)
-                lonf = float(lon)
-                if not (-90 <= latf <= 90 and -180 <= lonf <= 180):
-                    bad_coords.append(r)
+            lat = float(r.get("latitude")) if r.get("latitude") is not None else None
+            lon = float(r.get("longitude")) if r.get("longitude") is not None else None
+            if lat is None or lon is None:
+                return False
+            return not (-90 <= lat <= 90 and -180 <= lon <= 180)
         except Exception:
-            bad_coords.append(r)
+            return True
+
+    bad_coords = [r for r in rows if bad_coord(r)]
 
     report = {
         "total_rows": len(rows),
-        "missing_incident_type": {"count": len(missing_type), "sample": missing_type[:3]},
+        "missing_type_or_narrative": {"count": len(missing_type), "sample": missing_type[:3]},
         "missing_dates": {"count": len(missing_dates), "sample": missing_dates[:3]},
         "bad_coordinates": {"count": len(bad_coords), "sample": bad_coords[:3]},
     }
     return json.dumps(report, indent=2)
 
+
 if __name__ == "__main__":
-    MCP.run()
+    try:
+        MCP.run()
+    except Exception:
+        logger.exception("transform_server crashed")
+        raise
+
