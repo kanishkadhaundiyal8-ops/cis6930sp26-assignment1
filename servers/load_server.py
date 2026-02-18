@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import sqlite3
 from pathlib import Path
@@ -7,93 +9,72 @@ import pandas as pd
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
 
-MCP = FastMCP("load_server")
+MCP = FastMCP("load-server")
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "incidents.db"
+DB_PATH = Path("data/incidents.db")
 
 
-def _ensure_db_dir() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _ensure_db_dir():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _parse_json_list(data: str, ctx: str) -> List[Dict[str, Any]]:
     try:
         obj = json.loads(data)
     except json.JSONDecodeError as e:
-        raise ValueError(f"{ctx}: invalid JSON: {e}") from e
+        raise ValueError(f"Invalid JSON input to {ctx}: {e}") from e
 
     if not isinstance(obj, list):
-        raise ValueError(f"{ctx}: Input JSON must be a list (got {type(obj)})")
-
-    cleaned: List[Dict[str, Any]] = []
-    for row in obj:
-        if isinstance(row, dict):
-            cleaned.append(row)
-        else:
-            cleaned.append({"_value": row})
-    return cleaned
+        raise ValueError("Input JSON must be a list")
+    for i, row in enumerate(obj):
+        if not isinstance(row, dict):
+            raise ValueError(f"Row {i} is not an object")
+    return obj
 
 
-def _connect() -> sqlite3.Connection:
-    _ensure_db_dir()
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-
-def _stringify_complex_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _make_sqlite_safe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert any column values that are dict/list into JSON strings so SQLite can store them.
+    SQLite can't store dict/list directly -> convert dict/list values to JSON strings.
     """
     for col in df.columns:
-        # find at least one complex value in this column
-        has_complex = False
-        for v in df[col].head(50).tolist():
-            if isinstance(v, (dict, list)):
-                has_complex = True
-                break
-
-        if has_complex:
-            df[col] = df[col].apply(
-                lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
-            )
+        if df[col].map(lambda x: isinstance(x, (dict, list))).any():
+            df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
     return df
 
 
 @MCP.tool()
 def save_to_sqlite(data: str, table_name: str) -> str:
     """
-    Save processed data (JSON list[dict]) to SQLite under data/incidents.db
+    Save processed data (JSON list[object]) to SQLite.
+    Returns JSON: {ok, db_path, table, rows_saved, columns} or {ok:false, error,...}
     """
+    _ensure_db_dir()
+
     try:
-        if not table_name or not table_name.replace("_", "").isalnum():
-            raise ValueError("table_name must be alphanumeric/underscore only")
-
         rows = _parse_json_list(data, "save_to_sqlite")
+        if not table_name or not table_name.replace("_", "").isalnum():
+            return json.dumps({"ok": False, "error": "Invalid table_name"})
+
         df = pd.DataFrame(rows)
+        df = _make_sqlite_safe(df)
 
-        # convert dict/list values (e.g., location) into JSON strings
-        df = _stringify_complex_columns(df)
-
-        conn = _connect()
-        try:
+        with sqlite3.connect(DB_PATH) as conn:
             df.to_sql(table_name, conn, if_exists="replace", index=False)
-        finally:
-            conn.close()
 
-        msg = {
-            "ok": True,
-            "db_path": str(DB_PATH),
-            "table": table_name,
-            "rows_saved": int(len(df)),
-            "columns": list(df.columns),
-        }
-        return json.dumps(msg, indent=2)
-
+        return json.dumps(
+            {
+                "ok": True,
+                "db_path": str(DB_PATH.resolve()),
+                "table": table_name,
+                "rows_saved": int(len(df)),
+                "columns": list(df.columns),
+            },
+            indent=2,
+        )
     except Exception as e:
         logger.exception("save_to_sqlite failed")
         return json.dumps(
-            {"ok": False, "error": f"{type(e).__name__}: {str(e)}", "db_path": str(DB_PATH)},
+            {"ok": False, "error": f"{type(e).__name__}: {e}", "db_path": str(DB_PATH.resolve())},
             indent=2,
         )
 
@@ -101,96 +82,79 @@ def save_to_sqlite(data: str, table_name: str) -> str:
 @MCP.tool()
 def query_database(sql: str) -> str:
     """
-    Run a SQL query and return rows as JSON.
+    Execute SQL and return results as JSON list[dict].
+    (Matches tests that expect rows[0]["n"] style access.)
     """
+    if not DB_PATH.exists():
+        return json.dumps([{"error": "Database not found. Run save_to_sqlite first."}], indent=2)
+
     try:
-        if not DB_PATH.exists():
-            return json.dumps({"ok": False, "error": "Database not found. Run save_to_sqlite first."}, indent=2)
-
-        conn = _connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(sql)
-            cols = [d[0] for d in cur.description] if cur.description else []
-            out_rows = cur.fetchall() if cur.description else []
-        finally:
-            conn.close()
-
-        return json.dumps({"ok": True, "columns": cols, "rows": out_rows}, indent=2)
-
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(sql)
+            rows = cur.fetchall()
+            out = [dict(r) for r in rows]
+        return json.dumps(out, indent=2)
     except Exception as e:
-        logger.exception("query_database failed")
-        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)}"}, indent=2)
+        return json.dumps([{"error": f"{type(e).__name__}: {e}"}], indent=2)
 
 
 @MCP.tool()
 def generate_summary(table_name: str) -> str:
     """
-    Simple summary stats: row count, top narratives (or incident types if present), date min/max if possible.
+    Generate summary statistics for a table.
+    IMPORTANT: tests expect "total_rows" key.
     """
+    if not DB_PATH.exists():
+        return json.dumps({"ok": False, "error": "Database not found. Run save_to_sqlite first."}, indent=2)
+
     try:
-        if not DB_PATH.exists():
-            return json.dumps({"ok": False, "error": "Database not found. Run save_to_sqlite first."}, indent=2)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.execute(f"SELECT COUNT(*) AS n FROM {table_name};")
+            total_rows = int(cur.fetchone()[0])
 
-        conn = _connect()
-        try:
-            cur = conn.cursor()
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table_name});").fetchall()]
 
-            cur.execute(f"SELECT COUNT(*) FROM {table_name}")
-            count = cur.fetchone()[0]
-
-            # If incident_type doesn't exist (your data uses narrative), fall back
-            top_field = None
+            # pick a reasonable column for top values
+            top_col = None
             for candidate in ["incident_type", "narrative", "category"]:
-                try:
-                    cur.execute(f"SELECT {candidate} FROM {table_name} LIMIT 1")
-                    top_field = candidate
+                if candidate in cols:
+                    top_col = candidate
                     break
-                except Exception:
-                    continue
 
-            top_vals = []
-            if top_field:
-                cur.execute(
-                    f"""
-                    SELECT {top_field}, COUNT(*) as c
-                    FROM {table_name}
-                    WHERE {top_field} IS NOT NULL
-                    GROUP BY {top_field}
-                    ORDER BY c DESC
-                    LIMIT 10
-                    """
-                )
-                top_vals = cur.fetchall()
+            top_values = []
+            if top_col:
+                q = f"""
+                SELECT {top_col} AS value, COUNT(*) AS c
+                FROM {table_name}
+                GROUP BY {top_col}
+                ORDER BY c DESC
+                LIMIT 10;
+                """
+                top_values = conn.execute(q).fetchall()
+                top_values = [[r[0], r[1]] for r in top_values]
 
-            date_range = {}
-            for col in ["report_date", "offense_date", "report_date_parsed", "offense_date_parsed"]:
-                try:
-                    cur.execute(f"SELECT MIN({col}), MAX({col}) FROM {table_name} WHERE {col} IS NOT NULL")
-                    mn, mx = cur.fetchone()
-                    if mn is not None or mx is not None:
-                        date_range[col] = {"min": mn, "max": mx}
-                except Exception:
-                    continue
-
-        finally:
-            conn.close()
+            # date ranges (best effort)
+            date_ranges = {}
+            for dcol in ["report_date", "offense_date", "report_date_parsed", "offense_date_parsed"]:
+                if dcol in cols:
+                    r = conn.execute(f"SELECT MIN({dcol}), MAX({dcol}) FROM {table_name};").fetchone()
+                    date_ranges[dcol] = {"min": r[0], "max": r[1]}
 
         return json.dumps(
             {
                 "ok": True,
-                "db_path": str(DB_PATH),
+                "db_path": str(DB_PATH.resolve()),
                 "table": table_name,
-                "row_count": count,
-                "top_values": top_vals,
-                "date_ranges": date_range,
+                "total_rows": total_rows,   # <-- REQUIRED by your test
+                "row_count": total_rows,    # keep this too (nice for your pipeline output)
+                "top_values": top_values,
+                "date_ranges": date_ranges,
             },
             indent=2,
         )
-
     except Exception as e:
-        logger.exception("generate_summary failed")
-        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {str(e)}"}, indent=2)
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)
 
 
 if __name__ == "__main__":
