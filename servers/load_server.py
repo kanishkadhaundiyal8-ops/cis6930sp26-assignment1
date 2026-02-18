@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List
@@ -9,84 +10,86 @@ import pandas as pd
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
 
-MCP = FastMCP("load-server")
+MCP = FastMCP("load_server")
 
-DB_PATH = Path("data/incidents.db")
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "incidents.db"
 
 
-def _ensure_db_dir():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _parse_json_list(data: str, ctx: str) -> List[Dict[str, Any]]:
+def _safe_table_name(name: str) -> bool:
+    return bool(_TABLE_RE.match(name or ""))
+
+
+def _ensure_list_json(data: str) -> List[Dict[str, Any]]:
     try:
         obj = json.loads(data)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON input to {ctx}: {e}") from e
-
+    except Exception as e:
+        raise ValueError(f"Invalid JSON: {e}")
     if not isinstance(obj, list):
         raise ValueError("Input JSON must be a list")
+    # Ensure rows are dict-like
+    out: List[Dict[str, Any]] = []
     for i, row in enumerate(obj):
         if not isinstance(row, dict):
-            raise ValueError(f"Row {i} is not an object")
-    return obj
+            raise ValueError(f"Row {i} is not an object/dict")
+        out.append(row)
+    return out
 
 
-def _make_sqlite_safe(df: pd.DataFrame) -> pd.DataFrame:
+def _jsonify_nested(df: pd.DataFrame) -> pd.DataFrame:
     """
-    SQLite can't store dict/list directly -> convert dict/list values to JSON strings.
+    SQLite can't store dict/list objects directly. Convert any dict/list cell to a JSON string.
     """
     for col in df.columns:
-        if df[col].map(lambda x: isinstance(x, (dict, list))).any():
-            df[col] = df[col].apply(lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x)
+        df[col] = df[col].apply(
+            lambda x: json.dumps(x) if isinstance(x, (dict, list)) else x
+        )
     return df
 
 
 @MCP.tool()
-def save_to_sqlite(data: str, table_name: str) -> str:
+def save_to_sqlite(data: str, table_name: str = "incidents") -> str:
     """
-    Save processed data (JSON list[object]) to SQLite.
-    Returns JSON: {ok, db_path, table, rows_saved, columns} or {ok:false, error,...}
+    Save a JSON list of objects into SQLite (replace table each run).
+    Returns a JSON object with {ok, db_path, table, rows_saved, columns} or {ok:false,error,...}
     """
-    _ensure_db_dir()
+    if not _safe_table_name(table_name):
+        return json.dumps({"ok": False, "error": "Invalid table name", "db_path": str(DB_PATH)})
 
     try:
-        rows = _parse_json_list(data, "save_to_sqlite")
-        if not table_name or not table_name.replace("_", "").isalnum():
-            return json.dumps({"ok": False, "error": "Invalid table_name"})
-
+        rows = _ensure_list_json(data)
         df = pd.DataFrame(rows)
-        df = _make_sqlite_safe(df)
+        df = _jsonify_nested(df)
 
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(DB_PATH) as conn:
             df.to_sql(table_name, conn, if_exists="replace", index=False)
 
-        return json.dumps(
-            {
-                "ok": True,
-                "db_path": str(DB_PATH.resolve()),
-                "table": table_name,
-                "rows_saved": int(len(df)),
-                "columns": list(df.columns),
-            },
-            indent=2,
-        )
+        return json.dumps({
+            "ok": True,
+            "db_path": str(DB_PATH),
+            "table": table_name,
+            "rows_saved": int(len(df)),
+            "columns": list(df.columns),
+        })
     except Exception as e:
         logger.exception("save_to_sqlite failed")
-        return json.dumps(
-            {"ok": False, "error": f"{type(e).__name__}: {e}", "db_path": str(DB_PATH.resolve())},
-            indent=2,
-        )
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "db_path": str(DB_PATH)})
 
 
 @MCP.tool()
 def query_database(sql: str) -> str:
     """
     Execute SQL and return results as JSON list[dict].
-    (Matches tests that expect rows[0]["n"] style access.)
+    On error, return: [{"error": "..."}]
     """
     if not DB_PATH.exists():
-        return json.dumps([{"error": "Database not found. Run save_to_sqlite first."}], indent=2)
+        return json.dumps([{"error": "Database not found. Run save_to_sqlite first."}])
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -94,67 +97,67 @@ def query_database(sql: str) -> str:
             cur = conn.execute(sql)
             rows = cur.fetchall()
             out = [dict(r) for r in rows]
-        return json.dumps(out, indent=2)
+            return json.dumps(out)
     except Exception as e:
-        return json.dumps([{"error": f"{type(e).__name__}: {e}"}], indent=2)
+        return json.dumps([{"error": f"{type(e).__name__}: {e}"}])
 
 
 @MCP.tool()
-def generate_summary(table_name: str) -> str:
+def generate_summary(table_name: str = "incidents") -> str:
     """
-    Generate summary statistics for a table.
-    IMPORTANT: tests expect "total_rows" key.
+    Generate a small summary:
+      - total_rows
+      - top_values of incident_type/narrative
+      - date_ranges for known date columns (if present)
     """
+    if not _safe_table_name(table_name):
+        return json.dumps({"ok": False, "error": "Invalid table name", "db_path": str(DB_PATH), "table": table_name})
+
     if not DB_PATH.exists():
-        return json.dumps({"ok": False, "error": "Database not found. Run save_to_sqlite first."}, indent=2)
+        return json.dumps({"ok": False, "error": "Database not found. Run save_to_sqlite first.", "db_path": str(DB_PATH), "table": table_name})
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.execute(f"SELECT COUNT(*) AS n FROM {table_name};")
-            total_rows = int(cur.fetchone()[0])
+            conn.row_factory = sqlite3.Row
 
-            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table_name});").fetchall()]
+            total_rows = conn.execute(f"SELECT COUNT(*) AS n FROM {table_name};").fetchone()["n"]
 
-            # pick a reasonable column for top values
-            top_col = None
-            for candidate in ["incident_type", "narrative", "category"]:
-                if candidate in cols:
-                    top_col = candidate
-                    break
+            # Pick the best "type" column available
+            cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table_name});").fetchall()]
+            type_col = "incident_type" if "incident_type" in cols else ("narrative" if "narrative" in cols else None)
 
-            top_values = []
-            if top_col:
+            top_values: List[List[Any]] = []
+            if type_col:
                 q = f"""
-                SELECT {top_col} AS value, COUNT(*) AS c
+                SELECT {type_col} AS v, COUNT(*) AS n
                 FROM {table_name}
-                GROUP BY {top_col}
-                ORDER BY c DESC
+                WHERE {type_col} IS NOT NULL AND TRIM({type_col}) != ''
+                GROUP BY {type_col}
+                ORDER BY n DESC
                 LIMIT 10;
                 """
-                top_values = conn.execute(q).fetchall()
-                top_values = [[r[0], r[1]] for r in top_values]
+                top = conn.execute(q).fetchall()
+                top_values = [[r["v"], r["n"]] for r in top]
 
-            # date ranges (best effort)
-            date_ranges = {}
+            # Date ranges for common columns (only if present)
+            date_ranges: Dict[str, Dict[str, Any]] = {}
             for dcol in ["report_date", "offense_date", "report_date_parsed", "offense_date_parsed"]:
                 if dcol in cols:
-                    r = conn.execute(f"SELECT MIN({dcol}), MAX({dcol}) FROM {table_name};").fetchone()
-                    date_ranges[dcol] = {"min": r[0], "max": r[1]}
+                    r = conn.execute(
+                        f"SELECT MIN({dcol}) AS min_date, MAX({dcol}) AS max_date FROM {table_name};"
+                    ).fetchone()
+                    date_ranges[dcol] = {"min": r["min_date"], "max": r["max_date"]}
 
-        return json.dumps(
-            {
+            return json.dumps({
                 "ok": True,
-                "db_path": str(DB_PATH.resolve()),
+                "db_path": str(DB_PATH),
                 "table": table_name,
-                "total_rows": total_rows,   # <-- REQUIRED by your test
-                "row_count": total_rows,    # keep this too (nice for your pipeline output)
+                "total_rows": int(total_rows),   # <-- matches test expectation
                 "top_values": top_values,
                 "date_ranges": date_ranges,
-            },
-            indent=2,
-        )
+            })
     except Exception as e:
-        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, indent=2)
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "db_path": str(DB_PATH), "table": table_name})
 
 
 if __name__ == "__main__":
