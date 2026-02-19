@@ -21,20 +21,23 @@ City of Gainesville — Crime Responses dataset (Socrata SODA API)
 
 ---
 
-## Project Structure
 
+## Project Structure
+```
 cis6930sp26-assignment1/
-├── .github/workflows/pytest.yml
+├── .github/
+│   └── workflows/
+│       └── pytest.yml
 ├── servers/
-│ ├── extract_server.py
-│ ├── transform_server.py
-│ └── load_server.py
+│   ├── extract_server.py
+│   ├── transform_server.py
+│   └── load_server.py
 ├── tests/
-│ ├── test_extract.py
-│ ├── test_transform.py
-│ └── test_load.py
+│   ├── test_extract.py
+│   ├── test_transform.py
+│   └── test_load.py
 ├── data/
-│ └── incidents.db # generated
+│   └── incidents.db  # generated
 ├── .env.example
 ├── COLLABORATORS.md
 ├── LICENSE
@@ -42,9 +45,7 @@ cis6930sp26-assignment1/
 ├── pipeline.py
 ├── pyproject.toml
 └── uv.lock
-
-
----
+```
 
 ## Setup and Usage
 
