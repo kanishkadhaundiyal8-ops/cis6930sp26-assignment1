@@ -1,3 +1,16 @@
+
+\\\\
+
+
+
+
+
+
+
+adfZX vcv sd
+  sd [
+  k[sdop sdg dgdrggedgdfjopgsrgdgrfghioxcv
+
 # CIS 6930 — Assignment 1: MCP Data Pipeline
 
 **Student:** Kanishka Dineshchandra Dhaundiyal  
@@ -161,5 +174,5 @@ Categorization uses keyword heuristics; it may misclassify edge cases.
 
 The API may occasionally return unexpected rows/fields; errors are handled, but results can vary across runs.
 
-
-
+Screenshots
+(We will add screenshots here later: tool calls / pipeline run / DB verification.)
